@@ -104,6 +104,12 @@ impl PlotView {
         cx.notify();
     }
 
+    /// Show or hide the in-plot legend overlay.
+    pub fn set_show_legend(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.config.show_legend = show;
+        cx.notify();
+    }
+
     /// Reset manual pan/zoom, notify any linked views, and emit [`PlotEvent::ViewportChanged`].
     pub fn reset_view(&mut self, cx: &mut Context<Self>) {
         {

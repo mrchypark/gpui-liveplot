@@ -55,6 +55,7 @@ pub struct AxisConfig {
     units: Option<String>,
     formatter: AxisFormatter,
     tick_config: TickConfig,
+    time_offset_seconds: Option<i32>,
     show_grid: bool,
     show_minor_grid: bool,
     show_zero_line: bool,
@@ -72,6 +73,7 @@ impl AxisConfig {
             units: None,
             formatter: AxisFormatter::default(),
             tick_config: TickConfig::default(),
+            time_offset_seconds: None,
             show_grid: true,
             show_minor_grid: false,
             show_zero_line: false,
@@ -168,6 +170,12 @@ impl AxisConfigBuilder {
     /// The `pixel_spacing` hint determines how dense major ticks are.
     pub fn tick_config(mut self, config: TickConfig) -> Self {
         self.axis.tick_config = config;
+        self
+    }
+
+    /// Align major ticks to clean wall-clock intervals at the given UTC offset in seconds.
+    pub fn time_offset_seconds(mut self, offset_seconds: i32) -> Self {
+        self.axis.time_offset_seconds = Some(offset_seconds);
         self
     }
 
@@ -268,6 +276,7 @@ struct AxisLayoutKey {
     range: Range,
     pixels: u32,
     tick_config: TickConfig,
+    time_offset_seconds: Option<i32>,
 }
 
 /// Cached layout for axis ticks and labels.
@@ -290,6 +299,7 @@ impl AxisLayoutCache {
             range,
             pixels,
             tick_config: axis.tick_config(),
+            time_offset_seconds: axis.time_offset_seconds,
         };
         if self.key.as_ref() == Some(&key) {
             return &self.layout;
@@ -332,7 +342,10 @@ fn generate_ticks(axis: &AxisConfig, range: Range, pixel_length: f32) -> Vec<Tic
 fn generate_linear_ticks(axis: &AxisConfig, range: Range, pixel_length: f32) -> Vec<Tick> {
     let target = (pixel_length / axis.tick_config().pixel_spacing).max(2.0);
     let raw_step = range.span() / target as f64;
-    let step = nice_step(raw_step);
+    let step = match axis.time_offset_seconds {
+        Some(_) => nice_time_step(raw_step),
+        None => nice_step(raw_step),
+    };
     if !step.is_finite() || step <= 0.0 {
         return Vec::new();
     }
@@ -341,7 +354,8 @@ fn generate_linear_ticks(axis: &AxisConfig, range: Range, pixel_length: f32) -> 
     let minor_step = step / (minor_count as f64 + 1.0);
 
     let mut ticks = Vec::new();
-    let mut value = (range.min / step).floor() * step;
+    let offset = axis.time_offset_seconds.unwrap_or(0) as f64;
+    let mut value = ((range.min + offset) / step).floor() * step - offset;
     if value == -0.0 {
         value = 0.0;
     }
@@ -390,6 +404,22 @@ fn nice_step(step: f64) -> f64 {
     nice * base
 }
 
+fn nice_time_step(step: f64) -> f64 {
+    const STEPS: [f64; 12] = [
+        60.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0, 14400.0, 21600.0, 43200.0,
+        86400.0,
+    ];
+    if step <= 0.0 {
+        return 0.0;
+    }
+    for candidate in STEPS {
+        if step <= candidate {
+            return candidate;
+        }
+    }
+    (step / 86400.0).ceil() * 86400.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +429,37 @@ mod tests {
         let axis = AxisConfig::new();
         let ticks = generate_ticks(&axis, Range::new(0.0, 10.0), 400.0);
         assert!(ticks.iter().any(|tick| tick.is_major));
+    }
+
+    #[test]
+    fn time_ticks_align_to_kst_round_hours_and_five_minutes() {
+        let kst = 9 * 3600;
+        let axis = AxisConfig::builder().time_offset_seconds(kst).build();
+        let start = 1_794_517_200.0;
+        let ticks = generate_ticks(&axis, Range::new(start, start + 43200.0), 800.0);
+        let majors: Vec<f64> = ticks
+            .iter()
+            .filter(|t| t.is_major)
+            .map(|t| t.value)
+            .collect();
+        assert!(!majors.is_empty());
+        assert!(
+            majors
+                .iter()
+                .all(|v| ((*v as i64) + i64::from(kst)).rem_euclid(3600) == 0)
+        );
+
+        let zoomed = generate_ticks(&axis, Range::new(start, start + 1800.0), 800.0);
+        let zoom_majors: Vec<f64> = zoomed
+            .iter()
+            .filter(|t| t.is_major)
+            .map(|t| t.value)
+            .collect();
+        assert!(!zoom_majors.is_empty());
+        assert!(
+            zoom_majors
+                .iter()
+                .all(|v| ((*v as i64) + i64::from(kst)).rem_euclid(300) == 0)
+        );
     }
 }
