@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent,
-    StatefulInteractiveElement, Window, canvas, div, px,
+    Bounds, EventEmitter, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent,
+    Pixels, Point, ScrollEvent, ScrollSource, StatefulInteractiveElement, Window, canvas, div, px,
 };
 
 use crate::geom::{Point as DataPoint, ScreenPoint, ScreenRect};
@@ -24,6 +24,17 @@ use super::link::{LinkBinding, PlotLinkGroup, PlotLinkOptions, ViewSyncKind};
 use super::paint::{paint_frame, to_hsla};
 use super::state::{ClickState, DragMode, DragState, PinToggle, PlotUiState};
 
+/// Events emitted by [`PlotView`] when the user interacts with a chart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlotEvent {
+    /// Pointer hover X position in data coordinates, or `None` when cleared.
+    CursorX(Option<f64>),
+    /// Primary click/tap X position in data coordinates.
+    SelectedX(f64),
+    /// Visible data viewport changed by pan, zoom, or reset (`None`).
+    ViewportChanged(Option<Viewport>),
+}
+
 /// A GPUI view that renders a [`Plot`] with interactive controls.
 ///
 /// This view handles pan/zoom/box-zoom, hover readouts, and pin interactions
@@ -35,6 +46,8 @@ pub struct PlotView {
     config: PlotViewConfig,
     link: Option<LinkBinding>,
 }
+
+impl EventEmitter<PlotEvent> for PlotView {}
 
 impl PlotView {
     /// Create a new GPUI plot view for the given plot.
@@ -77,6 +90,75 @@ impl PlotView {
     pub fn plot_handle(&self) -> PlotHandle {
         PlotHandle {
             plot: Arc::clone(&self.plot),
+        }
+    }
+
+    /// Current window-relative view bounds after the latest layout pass.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.state.read().expect("plot state lock").view_bounds
+    }
+
+    /// Set or clear a persistent vertical marker at data coordinate `x`.
+    pub fn set_selected_x(&mut self, x: Option<f64>, cx: &mut Context<Self>) {
+        self.state.write().expect("plot state lock").selected_x = x.filter(|v| v.is_finite());
+        cx.notify();
+    }
+
+    /// Reset manual pan/zoom, notify any linked views, and emit [`PlotEvent::ViewportChanged`].
+    pub fn reset_view(&mut self, cx: &mut Context<Self>) {
+        {
+            let mut state = self.state.write().expect("plot state lock");
+            if let Ok(mut plot) = self.plot.write() {
+                plot.reset_view();
+            }
+            state.linked_brush_x = None;
+            state.clear_interaction();
+            self.publish_reset_link();
+            self.publish_brush_link(None);
+        }
+        cx.emit(PlotEvent::ViewportChanged(None));
+        cx.notify();
+    }
+
+    /// Zoom the viewport by multiplicative scale factors (`> 1.0` zooms in) around `screen_pos`.
+    pub fn zoom_by(
+        &mut self,
+        factor_x: f32,
+        factor_y: f32,
+        screen_pos: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !factor_x.is_finite() || !factor_y.is_finite() || factor_x <= 0.0 || factor_y <= 0.0 {
+            return;
+        }
+        let mut changed = None;
+        {
+            let mut state = self.state.write().expect("plot state lock");
+            let Some(transform) = state.transform.clone() else {
+                return;
+            };
+            let Some(rect) = state.plot_rect else {
+                return;
+            };
+            if let Ok(mut plot) = self.plot.write()
+                && let Some(viewport) = plot.viewport()
+            {
+                let center = screen_pos
+                    .and_then(|pos| transform.screen_to_data(screen_point(pos)))
+                    .unwrap_or_else(|| viewport.center());
+                let next = zoom_viewport(
+                    viewport,
+                    center,
+                    (1.0 / f64::from(factor_x)).clamp(0.1, 10.0),
+                    (1.0 / f64::from(factor_y)).clamp(0.1, 10.0),
+                );
+                self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                changed = Some(next);
+            }
+        }
+        if let Some(next) = changed {
+            cx.emit(PlotEvent::ViewportChanged(Some(next)));
+            cx.notify();
         }
     }
 
@@ -174,6 +256,8 @@ impl PlotView {
                 self.publish_brush_link(None);
             }
             state.clear_interaction();
+            drop(state);
+            cx.emit(PlotEvent::ViewportChanged(None));
             cx.notify();
             return;
         }
@@ -205,102 +289,123 @@ impl PlotView {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         let pos = screen_point(ev.position);
-        let mut state = self.state.write().expect("plot state lock");
-        state.last_cursor = Some(pos);
+        let cursor_x;
+        let mut changed_view = None;
+        {
+            let mut state = self.state.write().expect("plot state lock");
+            state.last_cursor = Some(pos);
 
-        if state.legend_hit(pos).is_some() {
-            state.hover = None;
-        } else if state.regions.hit_test(pos) == HitRegion::Plot {
-            state.hover = Some(pos);
-        } else {
-            state.hover = None;
-        }
-        let linked_cursor_x = state.hover.and_then(|_| {
-            state
-                .transform
-                .as_ref()
-                .and_then(|transform| transform.screen_to_data(pos))
-                .map(|point| point.x)
-        });
-        self.publish_cursor_link(linked_cursor_x);
+            if state.legend_hit(pos).is_some() {
+                state.hover = None;
+            } else if state.regions.hit_test(pos) == HitRegion::Plot {
+                state.hover = Some(pos);
+            } else {
+                state.hover = None;
+            }
+            let linked_cursor_x = state.hover.and_then(|_| {
+                state
+                    .transform
+                    .as_ref()
+                    .and_then(|transform| transform.screen_to_data(pos))
+                    .map(|point| point.x)
+            });
+            self.publish_cursor_link(linked_cursor_x);
+            cursor_x = linked_cursor_x;
 
-        let Some(mut drag) = state.drag.clone() else {
-            cx.notify();
-            return;
-        };
+            let Some(mut drag) = state.drag.clone() else {
+                drop(state);
+                cx.emit(PlotEvent::CursorX(cursor_x));
+                cx.notify();
+                return;
+            };
 
-        if !is_drag_button_held(drag.mode, ev.pressed_button) {
-            state.clear_interaction();
-            self.publish_cursor_link(None);
-            cx.notify();
-            return;
-        }
+            if !is_drag_button_held(drag.mode, ev.pressed_button) {
+                state.clear_interaction();
+                self.publish_cursor_link(None);
+                drop(state);
+                cx.emit(PlotEvent::CursorX(None));
+                cx.notify();
+                return;
+            }
 
-        let moved_sq = distance_sq(drag.start, pos);
-        if !drag.active && moved_sq > self.config.drag_threshold_px.powi(2) {
-            drag.active = true;
-        }
+            let moved_sq = distance_sq(drag.start, pos);
+            if !drag.active && moved_sq > self.config.drag_threshold_px.powi(2) {
+                drag.active = true;
+            }
 
-        if !drag.active {
-            state.drag = Some(drag);
-            cx.notify();
-            return;
-        }
+            if !drag.active {
+                state.drag = Some(drag);
+                drop(state);
+                cx.emit(PlotEvent::CursorX(cursor_x));
+                cx.notify();
+                return;
+            }
 
-        let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
-        let plot_rect = state.plot_rect;
-        let transform = state.transform.clone();
+            let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
+            let plot_rect = state.plot_rect;
+            let transform = state.transform.clone();
 
-        match drag.mode {
-            DragMode::Pan => {
-                if let (Some(rect), Some(transform)) = (plot_rect, transform) {
-                    if let Ok(mut plot) = self.plot.write() {
-                        if let Some(viewport) = plot.viewport() {
-                            if let Some(next) = pan_viewport(viewport, delta, &transform) {
+            match drag.mode {
+                DragMode::Pan => {
+                    if let (Some(rect), Some(transform)) = (plot_rect, transform) {
+                        if let Ok(mut plot) = self.plot.write() {
+                            if let Some(viewport) = plot.viewport() {
+                                if let Some(next) = pan_viewport(viewport, delta, &transform) {
+                                    self.apply_manual_view_with_link(
+                                        &mut plot, &mut state, rect, next,
+                                    );
+                                    changed_view = Some(next);
+                                }
+                            }
+                        }
+                    }
+                }
+                DragMode::ZoomRect => {
+                    state.selection_rect = Some(ScreenRect::new(drag.start, pos));
+                }
+                DragMode::ZoomX => {
+                    if let (Some(rect), Some(transform)) = (plot_rect, transform) {
+                        let axis_pixels = rect.width().max(1.0);
+                        let factor = zoom_factor_from_drag(delta.x, axis_pixels);
+                        if let Ok(mut plot) = self.plot.write() {
+                            if let Some(viewport) = plot.viewport() {
+                                let center = transform
+                                    .screen_to_data(pos)
+                                    .unwrap_or_else(|| viewport.x_center());
+                                let next = zoom_viewport(viewport, center, factor, 1.0);
                                 self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                                changed_view = Some(next);
+                            }
+                        }
+                    }
+                }
+                DragMode::ZoomY => {
+                    if let (Some(rect), Some(transform)) = (plot_rect, transform) {
+                        let axis_pixels = rect.height().max(1.0);
+                        let factor = zoom_factor_from_drag(-delta.y, axis_pixels);
+                        if let Ok(mut plot) = self.plot.write() {
+                            if let Some(viewport) = plot.viewport() {
+                                let center = transform
+                                    .screen_to_data(pos)
+                                    .unwrap_or_else(|| viewport.y_center());
+                                let next = zoom_viewport(viewport, center, 1.0, factor);
+                                self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                                changed_view = Some(next);
                             }
                         }
                     }
                 }
             }
-            DragMode::ZoomRect => {
-                state.selection_rect = Some(ScreenRect::new(drag.start, pos));
-            }
-            DragMode::ZoomX => {
-                if let (Some(rect), Some(transform)) = (plot_rect, transform) {
-                    let axis_pixels = rect.width().max(1.0);
-                    let factor = zoom_factor_from_drag(delta.x, axis_pixels);
-                    if let Ok(mut plot) = self.plot.write() {
-                        if let Some(viewport) = plot.viewport() {
-                            let center = transform
-                                .screen_to_data(pos)
-                                .unwrap_or_else(|| viewport.x_center());
-                            let next = zoom_viewport(viewport, center, factor, 1.0);
-                            self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
-                        }
-                    }
-                }
-            }
-            DragMode::ZoomY => {
-                if let (Some(rect), Some(transform)) = (plot_rect, transform) {
-                    let axis_pixels = rect.height().max(1.0);
-                    let factor = zoom_factor_from_drag(-delta.y, axis_pixels);
-                    if let Ok(mut plot) = self.plot.write() {
-                        if let Some(viewport) = plot.viewport() {
-                            let center = transform
-                                .screen_to_data(pos)
-                                .unwrap_or_else(|| viewport.y_center());
-                            let next = zoom_viewport(viewport, center, 1.0, factor);
-                            self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
-                        }
-                    }
-                }
-            }
+
+            drag.last = pos;
+            state.drag = Some(drag);
+            state.pending_click = None;
         }
 
-        drag.last = pos;
-        state.drag = Some(drag);
-        state.pending_click = None;
+        cx.emit(PlotEvent::CursorX(cursor_x));
+        if let Some(next) = changed_view {
+            cx.emit(PlotEvent::ViewportChanged(Some(next)));
+        }
         cx.notify();
     }
 
@@ -323,31 +428,199 @@ impl PlotView {
 
         self.publish_cursor_link(None);
         if changed {
+            cx.emit(PlotEvent::CursorX(None));
             cx.notify();
         }
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
         let pos = screen_point(ev.position);
-        let mut state = self.state.write().expect("plot state lock");
-        let drag = state.drag.clone();
+        let mut selected_x = None;
+        let mut changed_view = None;
+        {
+            let mut state = self.state.write().expect("plot state lock");
+            let drag = state.drag.clone();
 
-        if let Some(drag_state) = drag.as_ref() {
-            if drag_state.active && drag_state.mode == DragMode::ZoomRect {
-                if let (Some(rect), Some(transform)) =
-                    (state.selection_rect.take(), state.transform.clone())
-                {
-                    let rect = normalized_rect(rect);
+            if let Some(drag_state) = drag.as_ref() {
+                if drag_state.active && drag_state.mode == DragMode::ZoomRect {
+                    if let (Some(rect), Some(transform)) =
+                        (state.selection_rect.take(), state.transform.clone())
+                    {
+                        let rect = normalized_rect(rect);
+                        if let Ok(mut plot) = self.plot.write() {
+                            if let Some(viewport) = plot.viewport() {
+                                if let Some(next) = zoom_to_rect(viewport, rect, &transform) {
+                                    self.apply_manual_view_with_link(
+                                        &mut plot,
+                                        &mut state,
+                                        transform.screen(),
+                                        next,
+                                    );
+                                    self.publish_brush_link(Some(next.x));
+                                    changed_view = Some(next);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let click = state.pending_click.take();
+            let should_toggle = click.as_ref().is_some_and(|click| {
+                click.button == MouseButton::Left && click.region == HitRegion::Plot
+            }) && drag.as_ref().is_none_or(|drag| !drag.active)
+                && ev.click_count == 1;
+
+            if should_toggle {
+                if let Some(transform) = state.transform.clone() {
+                    if let Some(data_point) = transform.screen_to_data(pos) {
+                        state.selected_x = Some(data_point.x);
+                        selected_x = Some(data_point.x);
+                    }
                     if let Ok(mut plot) = self.plot.write() {
-                        if let Some(viewport) = plot.viewport() {
-                            if let Some(next) = zoom_to_rect(viewport, rect, &transform) {
-                                self.apply_manual_view_with_link(
-                                    &mut plot,
-                                    &mut state,
-                                    transform.screen(),
-                                    next,
-                                );
-                                self.publish_brush_link(Some(next.x));
+                        let target = state
+                            .hover_target
+                            .filter(|target| {
+                                hover_target_within_threshold(target, pos, &self.config)
+                            })
+                            .or_else(|| {
+                                compute_hover_target(
+                                    &plot,
+                                    &transform,
+                                    pos,
+                                    state.plot_rect,
+                                    self.config.pin_threshold_px,
+                                    self.config.unpin_threshold_px,
+                                )
+                            });
+
+                        if let Some(target) = target {
+                            let added = toggle_pin(plot.pins_mut(), target.pin);
+                            let now = Instant::now();
+                            state.last_pin_toggle = Some(PinToggle {
+                                pin: target.pin,
+                                added,
+                                at: now,
+                                screen_pos: target.screen,
+                            });
+                        }
+                    }
+                }
+            } else if ev.click_count > 1 {
+                state.last_pin_toggle = None;
+            }
+
+            state.drag = None;
+            state.selection_rect = None;
+            self.publish_cursor_link(None);
+        }
+
+        if let Some(x) = selected_x {
+            cx.emit(PlotEvent::SelectedX(x));
+        }
+        if let Some(next) = changed_view {
+            cx.emit(PlotEvent::ViewportChanged(Some(next)));
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up_out(&mut self, _ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        self.state
+            .write()
+            .expect("plot state lock")
+            .clear_interaction();
+        self.publish_cursor_link(None);
+        cx.emit(PlotEvent::CursorX(None));
+        cx.notify();
+    }
+
+    fn on_scroll(&mut self, ev: &ScrollEvent, _window: &Window, cx: &mut Context<Self>) {
+        let pos = screen_point(ev.position);
+        let mut changed_view = None;
+        let mut handled = false;
+        {
+            let mut state = self.state.write().expect("plot state lock");
+            if state.legend_hit(pos).is_some() {
+                return;
+            }
+            let region = state.regions.hit_test(pos);
+            let Some(transform) = state.transform.clone() else {
+                return;
+            };
+
+            let line_height = px(16.0);
+            let delta = ev.delta.pixel_delta(line_height);
+            if ev.source == ScrollSource::Touch {
+                // Mobile touch drags arrive as ScrollSource::Touch; pan instead of zooming.
+                state.hover = None;
+                let dx = f32::from(delta.x);
+                let dy = f32::from(delta.y);
+                if dx.abs() >= 0.01 || dy.abs() >= 0.01 {
+                    if let Ok(mut plot) = self.plot.write()
+                        && let Some(viewport) = plot.viewport()
+                        && let Some(rect) = state.plot_rect
+                    {
+                        match region {
+                            HitRegion::Plot => {
+                                if let Some(next) =
+                                    pan_viewport(viewport, ScreenPoint::new(dx, dy), &transform)
+                                {
+                                    self.apply_manual_view_with_link(
+                                        &mut plot, &mut state, rect, next,
+                                    );
+                                    changed_view = Some(next);
+                                }
+                                handled = true;
+                            }
+                            HitRegion::XAxis => {
+                                let factor = zoom_factor_from_drag(dx, rect.width().max(1.0));
+                                let center = transform
+                                    .screen_to_data(pos)
+                                    .unwrap_or_else(|| viewport.x_center());
+                                let next = zoom_viewport(viewport, center, factor, 1.0);
+                                self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                                changed_view = Some(next);
+                                handled = true;
+                            }
+                            HitRegion::YAxis => {
+                                let factor = zoom_factor_from_drag(-dy, rect.height().max(1.0));
+                                let center = transform
+                                    .screen_to_data(pos)
+                                    .unwrap_or_else(|| viewport.y_center());
+                                let next = zoom_viewport(viewport, center, 1.0, factor);
+                                self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                                changed_view = Some(next);
+                                handled = true;
+                            }
+                            HitRegion::Outside => {}
+                        }
+                    }
+                } else if region != HitRegion::Outside {
+                    handled = true;
+                }
+            } else {
+                let factor = scroll_zoom_factor(f32::from(delta.y));
+                if factor == 1.0 {
+                    return;
+                }
+
+                if let Ok(mut plot) = self.plot.write() {
+                    if let Some(viewport) = plot.viewport() {
+                        let center = transform
+                            .screen_to_data(pos)
+                            .unwrap_or_else(|| viewport.center());
+                        let (factor_x, factor_y) = match region {
+                            HitRegion::XAxis => (factor, 1.0),
+                            HitRegion::YAxis => (1.0, factor),
+                            HitRegion::Plot => (factor, factor),
+                            HitRegion::Outside => (1.0, 1.0),
+                        };
+                        if factor_x != 1.0 || factor_y != 1.0 {
+                            let next = zoom_viewport(viewport, center, factor_x, factor_y);
+                            if let Some(rect) = state.plot_rect {
+                                self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
+                                changed_view = Some(next);
+                                handled = true;
                             }
                         }
                     }
@@ -355,97 +628,15 @@ impl PlotView {
             }
         }
 
-        let click = state.pending_click.take();
-        let should_toggle = click.as_ref().is_some_and(|click| {
-            click.button == MouseButton::Left && click.region == HitRegion::Plot
-        }) && drag.as_ref().is_none_or(|drag| !drag.active)
-            && ev.click_count == 1;
-
-        if should_toggle {
-            if let Some(transform) = state.transform.clone() {
-                if let Ok(mut plot) = self.plot.write() {
-                    let target = state
-                        .hover_target
-                        .filter(|target| hover_target_within_threshold(target, pos, &self.config))
-                        .or_else(|| {
-                            compute_hover_target(
-                                &plot,
-                                &transform,
-                                pos,
-                                state.plot_rect,
-                                self.config.pin_threshold_px,
-                                self.config.unpin_threshold_px,
-                            )
-                        });
-
-                    if let Some(target) = target {
-                        let added = toggle_pin(plot.pins_mut(), target.pin);
-                        let now = Instant::now();
-                        state.last_pin_toggle = Some(PinToggle {
-                            pin: target.pin,
-                            added,
-                            at: now,
-                            screen_pos: target.screen,
-                        });
-                    }
-                }
-            }
-        } else if ev.click_count > 1 {
-            state.last_pin_toggle = None;
+        if handled {
+            cx.stop_propagation();
         }
-
-        state.drag = None;
-        state.selection_rect = None;
-        self.publish_cursor_link(None);
-        cx.notify();
-    }
-
-    fn on_mouse_up_out(&mut self, _ev: &MouseUpEvent, cx: &mut Context<Self>) {
-        let mut state = self.state.write().expect("plot state lock");
-        state.clear_interaction();
-        self.publish_cursor_link(None);
-        cx.notify();
-    }
-
-    fn on_scroll(&mut self, ev: &ScrollEvent, _window: &Window, cx: &mut Context<Self>) {
-        let pos = screen_point(ev.position);
-        let mut state = self.state.write().expect("plot state lock");
-        if state.legend_hit(pos).is_some() {
-            return;
+        if let Some(next) = changed_view {
+            cx.emit(PlotEvent::ViewportChanged(Some(next)));
         }
-        let region = state.regions.hit_test(pos);
-        let Some(transform) = state.transform.clone() else {
-            return;
-        };
-
-        let line_height = px(16.0);
-        let delta = ev.delta.pixel_delta(line_height);
-        let factor = scroll_zoom_factor(f32::from(delta.y));
-        if factor == 1.0 {
-            return;
+        if handled || changed_view.is_some() {
+            cx.notify();
         }
-
-        if let Ok(mut plot) = self.plot.write() {
-            if let Some(viewport) = plot.viewport() {
-                let center = transform
-                    .screen_to_data(pos)
-                    .unwrap_or_else(|| viewport.center());
-                let (factor_x, factor_y) = match region {
-                    HitRegion::XAxis => (factor, 1.0),
-                    HitRegion::YAxis => (1.0, factor),
-                    HitRegion::Plot => (factor, factor),
-                    HitRegion::Outside => (1.0, 1.0),
-                };
-                if factor_x != 1.0 || factor_y != 1.0 {
-                    let next = zoom_viewport(viewport, center, factor_x, factor_y);
-                    if let Some(rect) = state.plot_rect {
-                        self.apply_manual_view_with_link(&mut plot, &mut state, rect, next);
-                    }
-                }
-            }
-        }
-
-        cx.notify();
     }
 }
 
@@ -530,6 +721,13 @@ impl Render for PlotView {
             )
             .on_scroll(cx.listener(|this, ev, window, cx| {
                 this.on_scroll(ev, window, cx);
+            }))
+            .on_pinch(cx.listener(|this, ev: &PinchEvent, _, cx| {
+                let factor = pinch_zoom_scale(ev.delta);
+                if (factor - 1.0).abs() > f32::EPSILON {
+                    this.zoom_by(factor, factor, Some(ev.position), cx);
+                    cx.stop_propagation();
+                }
             }))
     }
 }
@@ -695,6 +893,13 @@ fn scroll_zoom_factor(delta_y: f32) -> f64 {
     (1.0 - (delta_y as f64 * 0.002)).clamp(0.1, 10.0)
 }
 
+fn pinch_zoom_scale(delta: f32) -> f32 {
+    if !delta.is_finite() || delta.abs() < 0.0001 {
+        return 1.0;
+    }
+    delta.exp().clamp(0.1, 10.0)
+}
+
 trait ViewportCenter {
     fn center(&self) -> DataPoint;
     fn x_center(&self) -> DataPoint;
@@ -726,7 +931,13 @@ impl ViewportCenter for Viewport {
 
 #[cfg(test)]
 mod tests {
-    use super::{DragMode, MouseButton, is_drag_button_held, scroll_zoom_factor};
+    use super::{
+        DragMode, MouseButton, ScreenPoint, is_drag_button_held, pan_viewport, pinch_zoom_scale,
+        scroll_zoom_factor,
+    };
+    use crate::geom::ScreenRect;
+    use crate::transform::Transform;
+    use crate::view::{Range, Viewport};
 
     #[test]
     fn drag_requires_matching_button() {
@@ -760,5 +971,19 @@ mod tests {
     fn negative_scroll_delta_zooms_out_after_reversal() {
         let factor = scroll_zoom_factor(-120.0);
         assert!(factor > 1.0, "expected zoom-out factor, got {factor}");
+    }
+
+    #[test]
+    fn positive_pinch_delta_zooms_in_and_touch_pan_moves_opposite_drag() {
+        assert!(pinch_zoom_scale(0.1) > 1.0);
+        assert!(pinch_zoom_scale(-0.1) < 1.0);
+        assert_eq!(pinch_zoom_scale(f32::NAN), 1.0);
+
+        let viewport = Viewport::new(Range::new(100.0, 200.0), Range::new(0.0, 10.0));
+        let rect = ScreenRect::new(ScreenPoint::new(0.0, 0.0), ScreenPoint::new(100.0, 100.0));
+        let transform = Transform::new(viewport, rect).unwrap();
+        let panned = pan_viewport(viewport, ScreenPoint::new(10.0, 0.0), &transform).unwrap();
+        assert!(panned.x.min < viewport.x.min);
+        assert_eq!(panned.y, viewport.y);
     }
 }

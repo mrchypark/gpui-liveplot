@@ -40,8 +40,10 @@ pub(crate) fn build_frame(
     let full_width = f32::from(bounds.size.width);
     let full_height = f32::from(bounds.size.height);
     if full_width <= 1.0 || full_height <= 1.0 {
+        state.view_bounds = None;
         return PlotFrame { render };
     }
+    state.view_bounds = Some(bounds);
 
     let viewport = plot
         .refresh_viewport(config.padding_frac, config.min_padding)
@@ -1089,7 +1091,7 @@ fn build_linked_cursor(
     plot_rect: ScreenRect,
     measurer: &GpuiTextMeasurer<'_>,
 ) {
-    let Some(x) = state.linked_cursor_x else {
+    let Some(x) = state.linked_cursor_x.or(state.selected_x) else {
         return;
     };
     if state.hover.is_some() {

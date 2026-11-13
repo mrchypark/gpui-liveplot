@@ -56,5 +56,5 @@ pub use style::Theme;
 pub use view::{Range, View, Viewport};
 
 pub use gpui_backend::{
-    LinkMemberId, PlotHandle, PlotLinkGroup, PlotLinkOptions, PlotView, PlotViewConfig,
+    LinkMemberId, PlotEvent, PlotHandle, PlotLinkGroup, PlotLinkOptions, PlotView, PlotViewConfig,
 };
