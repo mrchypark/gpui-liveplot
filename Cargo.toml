@@ -25,6 +25,6 @@ gpui-fast = ["gpui-kit/gpui-fast"]
 gpui_component_theme = ["gpui-kit/component"]
 
 [dependencies]
-gpui-kit = { version = "=0.8.1", default-features = false }
+gpui-kit = { version = "=0.10.0", default-features = false }
 
 [workspace]
